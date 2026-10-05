@@ -1,0 +1,366 @@
+name: RMX2117 ReSukiSU 4.2.0-rc3 SUSFS build
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup build environment
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo -E apt-get -y -qq install git make bc bison ccache openssl dos2unix zip kmod cpio flex libelf-dev curl libssl-dev libtfm-dev wget device-tree-compiler ca-certificates python3 binutils binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+    - name: Download GCC toolchain
+      run: |
+        set -euo pipefail
+        cd $GITHUB_WORKSPACE/kernel_workspace
+
+        mkdir gcc64
+        wget -O gcc-aarch64.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz
+        tar -C gcc64/ -zxvf gcc-aarch64.tar.gz
+
+        mkdir gcc32
+        wget -O gcc-arm.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz
+        tar -C gcc32/ -zxvf gcc-arm.tar.gz
+    - name: Install Clang toolchain
+      run: |
+        set -euo pipefail
+        sudo apt install -y clang lld llvm
+    - name: Clone kernel source
+      run: |
+        set -euo pipefail
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        CLONE_BRANCH="${{ github.event.inputs.Branch }}"
+        echo "使用 $CLONE_BRANCH 分支"
+        git clone --filter=blob:none --no-checkout https://github.com/sanba0519/OPPO-Realme_kernel_4.14_MT6853.git android-kernel
+                git -C android-kernel checkout cb1cb5f3c12e345d2f7e22d7ff582ca7d74aad0a
+        cd android-kernel
+    - name: Apply patch
+      run: |
+        set -euo pipefail
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        if [ "${{ github.event.inputs.SU }}" = "RKSU" ]; then
+          echo "KSU_LOG: 选择了 RKSU"
+          echo "KSU_LOG: 开始下载并应用 RKSU 官方 4.14 patch"
+          wget https://github.com/rksuorg/kernel_patches/raw/master/manual_hook/kernel-4.14.patch -O ksu-4.14.patch || { echo "下载 patch 失败"; exit 1; }
+          patch -p1 < ksu-4.14.patch || { echo "patch 应用失败"; cat ksu-4.14.patch; exit 1; }
+
+        elif [ "${{ github.event.inputs.SU }}" = "BakaSU" ]; then
+          echo "KSU_LOG: 选择了 BakaSU"
+          if [ "${{ github.event.inputs.SUSFS }}" = "true" ]; then
+            echo "KSU_LOG: SUSFS 使用 BakaSU inline hooks，跳过 4.14 manual hook patch"
+          else
+            echo "KSU_LOG: 开始下载并应用 BakaSU 官方 4.14 manual hook patch"
+            wget -O BakaSU-4.14.patch \
+                https://raw.githubusercontent.com/ReSukiSU/ReSukiSU_Patches/main/scope-minimized/kernel-4.14.patch \
+              || { echo "下载 BakaSU 官方 patch 失败"; exit 1; }
+            patch -p1 < BakaSU-4.14.patch || { echo "BakaSU 官方 patch 应用失败"; cat BakaSU-4.14.patch; exit 1; }
+          fi
+
+        else
+          echo "KSU_LOG: 未知的 SU 选项，默认使用 RKSU"
+        fi
+
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+
+        if [ "${{ github.event.inputs.SUSFS }}" = "true" ]; then
+          echo "KSU_LOG: 开启 SUSFS"
+          wget https://raw.githubusercontent.com/sanba0519/Kernel-patch/034636ef261733e5e89e2349ed0194b6820f8421/susfs_patch_to_4.14.patch -O susfs-4.14.patch
+          patch -p1 < susfs-4.14.patch || { echo "SUSFS patch 应用失败"; exit 1; }
+          # A label cannot be followed directly by a declaration in GNU C89.
+          sed -i 's/^orig_flow:$/orig_flow:;/' fs/notify/fdinfo.c
+          grep -q '^orig_flow:;$' fs/notify/fdinfo.c \
+            || { echo "SUSFS fdinfo 4.14 兼容修正失败"; exit 1; }
+        fi
+    - name: Setup KernelSU
+      run: |
+        set -euo pipefail
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        rm -rf KernelSU
+        if [ "${{ github.event.inputs.SU }}" = "BakaSU" ]; then
+          echo "KSU_LOG: Setup BakaSU"
+          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/239e1e8871b8fcd51a6e5b3002e0ba522fdd99fb/kernel/setup.sh" | bash -s 239e1e8871b8fcd51a6e5b3002e0ba522fdd99fb
+          test "$(git -C KernelSU rev-parse HEAD)" = 239e1e8871b8fcd51a6e5b3002e0ba522fdd99fb
+          if [ "${{ github.event.inputs.SUSFS }}" = "true" ]; then
+            echo "KSU_LOG: 应用 BakaSU SUSFS inline hooks"
+            curl -LfsS \
+              https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/4b96c552c5d599bed83fb7261b6ed916453a8f4a/Patches/susfs_inline_hook_patches.sh \
+              -o susfs_inline_hook_patches.sh \
+              || { echo "下载 SUSFS inline hook 脚本失败"; exit 1; }
+            bash susfs_inline_hook_patches.sh
+          fi
+        else
+          echo "KSU_LOG: Setup RKSU (rsuntk)"
+          curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s main
+        fi
+    - name: Setup NoMount
+      if: ${{ github.event.inputs.nomount == 'true' }}
+      run: |
+        set -euo pipefail
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        echo "开始集成 NoMount..."
+        curl -LfsS \
+          https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh \
+          -o nomount-setup.sh \
+          || { echo "下载 NoMount setup 脚本失败"; exit 1; }
+        bash nomount-setup.sh dev
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: build-kernel-mido-kernel
+        max-size: 3G
+    - name: Configure and build kernel
+      run: |
+        set -euo pipefail
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/gcc64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc32/bin:$PATH
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export KBUILD_BUILD_HOST=GitHubActions
+        export KBUILD_BUILD_USER=lykwzzwzss
+
+        make -j$(nproc --all) O=out ARCH=arm64 mt6853-ss_defconfig
+
+        # DroidSpace
+        if [ "${{ github.event.inputs.DroidSpace }}" = "true" ]; then
+          echo "启用 DroidSpace..."
+          ./scripts/config --file out/.config \
+            --enable SYSCTL \
+            --enable SYSVIPC \
+            --enable POSIX_MQUEUE \
+            --enable NAMESPACES \
+            --enable PID_NS \
+            --enable UTS_NS \
+            --enable IPC_NS \
+            --enable NET_NS \
+            --enable MULTIUSER \
+            --enable USER_NS \
+            --enable DEVTMPFS \
+            --enable DEVTMPFS_MOUNT \
+            --enable SECCOMP \
+            --enable SECCOMP_FILTER \
+            --enable CGROUPS \
+            --enable CGROUP_DEVICE \
+            --enable CGROUP_PIDS \
+            --enable MEMCG \
+            --enable CGROUP_SCHED \
+            --enable FAIR_GROUP_SCHED \
+            --enable CGROUP_FREEZER \
+            --enable CGROUP_NET_PRIO \
+            --enable OVERLAY_FS \
+            --enable TMPFS_POSIX_ACL \
+            --enable TMPFS_XATTR \
+            --enable FW_LOADER \
+            --enable FW_LOADER_USER_HELPER \
+            --enable FW_LOADER_COMPRESS \
+            --enable VETH \
+            --enable BRIDGE \
+            --enable NETFILTER \
+            --enable BRIDGE_NETFILTER \
+            --enable NETFILTER_ADVANCED \
+            --enable NF_CONNTRACK \
+            --enable IP_NF_IPTABLES \
+            --enable IP_NF_FILTER \
+            --enable NF_NAT \
+            --enable NF_TABLES \
+            --enable IP_NF_TARGET_MASQUERADE \
+            --enable NETFILTER_XT_TARGET_MASQUERADE \
+            --enable NETFILTER_XT_TARGET_TCPMSS \
+            --enable NETFILTER_XT_MATCH_ADDRTYPE \
+            --enable NF_CONNTRACK_NETLINK \
+            --enable NF_NAT_REDIRECT \
+            --enable IP_ADVANCED_ROUTER \
+            --enable IP_MULTIPLE_TABLES \
+            --enable NF_CONNTRACK_IPV4 \
+            --enable NF_NAT_IPV4 \
+            --enable IP_NF_NAT \
+            --enable NETFILTER_XT_MATCH_COMMENT \
+            --enable NETFILTER_XT_MATCH_STATE \
+            --enable NETFILTER_XT_MATCH_CONNTRACK \
+            --enable NETFILTER_XT_MATCH_MULTIPORT \
+            --enable NETFILTER_XT_MATCH_HL \
+            --enable NETFILTER_XT_TARGET_REJECT \
+            --enable IP_NF_TARGET_REJECT \
+            --enable NETFILTER_XT_TARGET_LOG \
+            --enable IP_NF_TARGET_ULOG \
+            --enable NETFILTER_XT_MATCH_RECENT \
+            --enable NETFILTER_XT_MATCH_LIMIT \
+            --enable NETFILTER_XT_MATCH_HASHLIMIT \
+            --enable NETFILTER_XT_MATCH_OWNER \
+            --enable NETFILTER_XT_MATCH_PKTTYPE \
+            --enable NETFILTER_XT_MATCH_MARK \
+            --enable NETFILTER_XT_TARGET_MARK \
+            --enable IP_SET \
+            --enable IP_SET_HASH_IP \
+            --enable IP_SET_HASH_NET \
+            --enable NETFILTER_XT_SET \
+            --enable NETFILTER_NETLINK_QUEUE \
+            --enable NETFILTER_NETLINK_LOG \
+            --enable NETFILTER_XT_TARGET_NFLOG \
+            --disable ANDROID_PARANOID_NETWORK
+          make O=out olddefconfig
+        else
+          echo "不启用 DroidSpace，使用默认配置"
+        fi
+
+        # BBR
+        if [ "${{ github.event.inputs.BBR }}" = "true" ]; then
+          echo "启用 BBR..."
+          ./scripts/config --file out/.config \
+            --enable CONFIG_TCP_CONG_BBR \
+            --enable CONFIG_NET_SCH_FQ
+          make O=out olddefconfig
+        else
+          echo "不启用 BBR..."
+        fi
+
+        # 最终配置修正
+        # DroidSpace 需要 USER_NS（docker unsafe procfs 修复），仅在启用时保留
+        if [ "${{ github.event.inputs.DroidSpace }}" = "true" ]; then
+          ./scripts/config --file out/.config \
+                  --enable CONFIG_NAMESPACES \
+                  --enable CONFIG_DEVTMPFS \
+                  --enable CONFIG_USER_NS \
+                  --enable CONFIG_DEVTMPFS_MOUNT \
+                  --enable CONFIG_SECTION_MISMATCH_WARN_ONLY
+        else
+          ./scripts/config --file out/.config \
+                  --enable CONFIG_NAMESPACES \
+                  --enable CONFIG_DEVTMPFS \
+                  --disable CONFIG_USER_NS \
+                  --enable CONFIG_DEVTMPFS_MOUNT \
+                  --enable CONFIG_SECTION_MISMATCH_WARN_ONLY
+        fi
+
+        # KernelSU 和 SUSFS 配置
+        # 如果启用了 SUSFS，无论哪个 SU 都必须启用 CONFIG_KSU_SUSFS
+        if [ "${{ github.event.inputs.SUSFS }}" = "true" ]; then
+          echo "KSU_LOG: 启用 CONFIG_KSU + CONFIG_KSU_SUSFS"
+          ./scripts/config --file out/.config \
+            --enable CONFIG_KSU \
+            --enable CONFIG_KSU_SUSFS \
+            --disable CONFIG_KSU_MANUAL_HOOK \
+            --disable CONFIG_KSU_TRACEPOINT_HOOK
+        elif [ "${{ github.event.inputs.SU }}" = "BakaSU" ]; then
+          echo "KSU_LOG: BakaSU 不启用 SUSFS，使用 manual hook"
+          ./scripts/config --file out/.config \
+            --enable CONFIG_KSU \
+            --enable CONFIG_KSU_MANUAL_HOOK \
+            --disable CONFIG_KSU_SUSFS \
+            --disable CONFIG_KSU_TRACEPOINT_HOOK
+        fi
+
+
+        if [ "${{ github.event.inputs.nomount }}" = "true" ]; then
+          echo "启用 NoMount..."
+          ./scripts/config --file out/.config \
+            --enable CONFIG_NOMOUNT \
+            --enable CONFIG_KEYS
+        else
+          echo "不启用 NoMount..."
+          ./scripts/config --file out/.config --disable CONFIG_NOMOUNT
+        fi
+
+        make O=out ARCH=arm64 olddefconfig
+
+        if [ "${{ github.event.inputs.nomount }}" = "true" ]; then
+          grep -qx 'CONFIG_NOMOUNT=y' out/.config \
+            && grep -qx 'CONFIG_KEYS=y' out/.config \
+            || { echo "NoMount 或 CONFIG_KEYS 配置未生效，终止编译"; exit 1; }
+        elif grep -Eq '^CONFIG_NOMOUNT=(y|m)$' out/.config; then
+          echo "NoMount 未关闭，终止编译"
+          exit 1
+        fi
+
+        # 编译
+        make -j"$(nproc)" \
+                O=out \
+                ARCH=arm64 \
+                CC="ccache clang" \
+                CLANG_TRIPLE=aarch64-linux-gnu- \
+                CROSS_COMPILE=aarch64-linux-android- \
+                CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+                CFLAGS_KERNEL="-fintegrated-as" \
+                CFLAGS_MODULE="-fintegrated-as" \
+                LD=ld.lld \
+                AR=llvm-ar \
+                NM=llvm-nm \
+                OBJCOPY=llvm-objcopy \
+                OBJDUMP=llvm-objdump \
+                STRIP=llvm-strip
+    - name: Verify root interface and export build evidence
+      run: |
+        set -euo pipefail
+        cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+        test "$(git -C KernelSU rev-parse HEAD)" = "239e1e8871b8fcd51a6e5b3002e0ba522fdd99fb"
+        grep -Eq 'KERNEL_SU_UAPI_VERSION = 4;' KernelSU/uapi/supercall.h
+        grep -qx 'CONFIG_KSU=y' out/.config
+        grep -qx 'CONFIG_KSU_SUSFS=y' out/.config
+        test -s out/arch/arm64/boot/Image.gz-dtb
+        mkdir -p "$GITHUB_WORKSPACE/build-evidence"
+        cp out/.config "$GITHUB_WORKSPACE/build-evidence/kernel.config"
+        cp KernelSU/uapi/supercall.h "$GITHUB_WORKSPACE/build-evidence/root-uapi.h"
+        git rev-parse HEAD > "$GITHUB_WORKSPACE/build-evidence/kernel-commit.txt"
+        git -C KernelSU rev-parse HEAD > "$GITHUB_WORKSPACE/build-evidence/root-commit.txt"
+        sha256sum out/arch/arm64/boot/Image.gz-dtb > "$GITHUB_WORKSPACE/build-evidence/SHA256.txt"
+    - name: Upload kernel and build evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: RMX2117-ReSukiSU-4.2.0-rc3-SUSFS
+        path: |-
+          kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz-dtb
+          build-evidence/
+        if-no-files-found: error
+        retention-days: 14
+    - name: Upload diagnostics even on failure
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: RMX2117-build-diagnostics
+        path: |-
+          kernel_workspace/android-kernel/out/.config
+          kernel_workspace/android-kernel/*.rej
+        if-no-files-found: ignore
+        retention-days: 14
+    timeout-minutes: 120
+'on':
+  workflow_dispatch:
+    inputs:
+      SU:
+        type: choice
+        description: 选择要使用的 Root 管理器
+        required: true
+        default: BakaSU
+        options:
+        - BakaSU
+      BBR:
+        type: boolean
+        description: 是否启用 BBR 加速（不了解请不要启用）
+        required: false
+        default: true
+      DroidSpace:
+        type: boolean
+        description: 是否启用 DroidSpace（不了解请不要启用）
+        required: false
+        default: false
+      SUSFS:
+        type: boolean
+        description: 是否加入 SUSFS
+        required: false
+        default: true
+      nomount:
+        type: boolean
+        description: 是否启用 NoMount
+        required: false
+        default: false
+      Branch:
+        type: choice
+        description: 选择要 clone 的分支（仅供开发者选择）
+        required: true
+        default: main
+        options:
+        - main
+permissions:
+  contents: read
